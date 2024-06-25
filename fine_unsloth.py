@@ -6,8 +6,7 @@ from transformers import LlamaForCausalLM, PreTrainedTokenizerFast, Trainer, Tra
 import math
 import psutil
 import torch
-import concurrent.futures
-from multiprocessing import cpu_count
+from torch.utils.data import DataLoader
 
 # Configure logging
 log_filename = 'finetuning.log'
@@ -42,7 +41,7 @@ def load_and_prepare_dataset(dataset_path):
         raise
 
 # Tokenize the dataset
-def tokenize_function(examples, tokenizer):
+def tokenize_function(tokenizer, examples):
     return tokenizer(examples["tokens"], padding="max_length", truncation=True, max_length=512)
 
 # Compute metrics function
@@ -112,21 +111,20 @@ def main():
     # Inspect dataset structure
     logging.info(f"Dataset features: {dataset.features}")
 
-    # Tokenize the dataset using multithreading
-    logging.info("Using multithreading for tokenization")
+    # Tokenize the dataset using DataLoader to leverage GPU for tokenization
+    logging.info("Using GPU for tokenization")
 
-    tokenized_data = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_count()) as executor:
-        futures = [executor.submit(tokenize_function, example, tokenizer) for example in dataset]
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                tokenized_data.append(future.result())
-            except Exception as e:
-                logging.error(f"Error in tokenization: {e}")
+    def collate_fn(examples):
+        return tokenizer(examples['tokens'], padding='max_length', truncation=True, max_length=512, return_tensors='pt')
 
-    # Convert the list back to a Dataset object
-    tokenized_datasets = Dataset.from_dict({'input_ids': [item['input_ids'] for item in tokenized_data],
-                                            'attention_mask': [item['attention_mask'] for item in tokenized_data]})
+    dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn, num_workers=cpu_count())
+
+    tokenized_data = {'input_ids': [], 'attention_mask': []}
+    for batch in dataloader:
+        for k, v in batch.items():
+            tokenized_data[k].extend(v.cpu().numpy())
+
+    tokenized_datasets = Dataset.from_dict(tokenized_data)
 
     # Check the columns in the tokenized dataset
     logging.info(f"Tokenized dataset columns: {tokenized_datasets.column_names}")
@@ -142,8 +140,8 @@ def main():
         output_dir=generate_unique_output_dir(output_dir),
         overwrite_output_dir=True,
         num_train_epochs=3,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=4,
+        per_device_train_batch_size=1,  # Lowered batch size
+        gradient_accumulation_steps=4,  # Adjusted gradient accumulation steps
         learning_rate=2e-5,
         lr_scheduler_type="cosine",
         warmup_steps=500,
@@ -154,7 +152,7 @@ def main():
         eval_strategy="steps",
         eval_steps=500,
         report_to="none",
-        dataloader_num_workers=cpu_count(),  # Use all available CPU cores
+        dataloader_num_workers=1,  # Reduced number of workers
         fp16=True,
         optim="adamw_torch",
     )
